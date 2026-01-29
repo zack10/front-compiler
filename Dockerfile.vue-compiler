@@ -1,0 +1,36 @@
+# 1. Upgrade to Node 22 (LTS) to fix Vite 7 / crypto.hash errors
+FROM node:22-alpine
+
+WORKDIR /workspace
+
+# 2. Create the Vue template
+RUN npm create vite@latest template-app -- --template vue-ts
+WORKDIR /workspace/template-app
+
+# 3. Create the TypeScript shim (using printf for reliable newlines in Alpine)
+RUN printf 'declare module "*.vue" {\n\
+  import type { DefineComponent } from "vue";\n\
+  const component: DefineComponent<{}, {}, any>;\n\
+  export default component;\n\
+}' > src/env.d.ts
+
+# 4. Relax TypeScript rules
+RUN sed -i 's/"noUnusedLocals": true/"noUnusedLocals": false/g' tsconfig.json || true && \
+    sed -i 's/"noUnusedParameters": true/"noUnusedParameters": false/g' tsconfig.json || true
+
+# 5. Ensure the shim is included in the compilation
+RUN sed -i 's/"include": \[/"include": \["src\/env.d.ts", /g' tsconfig.app.json || \
+    sed -i 's/"include": \[/"include": \["src\/env.d.ts", /g' tsconfig.json
+
+# 6. Install dependencies as root to ensure cache directories are created correctly
+RUN npm install
+
+# 7. Set ownership and user
+RUN addgroup -g 1001 -S vue && \
+    adduser -S vue -u 1001 && \
+    chown -R vue:vue /workspace
+
+# Switch to the non-root user for security during builds
+USER vue
+
+CMD ["node", "--version"]

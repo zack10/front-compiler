@@ -1,0 +1,28 @@
+# 1. Upgrade to Node 22 to fix the Vite 7 / crypto.hash error
+FROM node:22-alpine
+
+WORKDIR /workspace
+
+# 2. Create the React template
+RUN npm create vite@latest template-app -- --template react-ts
+WORKDIR /workspace/template-app
+
+RUN sed -i "/import '.\/index.css'/d" src/main.tsx && \
+    sed -i "/import '.\/App.css'/d" src/main.tsx
+
+# 3. Target all tsconfig files to relax strict mode for the sandbox
+RUN sed -i 's/"noUnusedLocals": true/"noUnusedLocals": false/g' *.json && \
+    sed -i 's/"noUnusedParameters": true/"noUnusedParameters": false/g' *.json
+
+# 4. Run npm install as root so it has permissions to build the cache
+RUN npm install
+
+# 5. Set up the non-root user for security during the build process
+RUN addgroup -g 1001 -S react && \
+    adduser -S react -u 1001 && \
+    chown -R react:react /workspace
+
+# Switch to the non-root user
+USER react
+
+CMD ["node", "--version"]

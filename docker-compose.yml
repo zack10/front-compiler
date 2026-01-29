@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  # The main API that orchestrates the compilations
+  compiler-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.compiler-service
+    ports:
+      - "3001:3001"
+    volumes:
+      # Required to let the API start/stop other containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Host-mounted caches for speed
+      - /tmp/angular-cache:/tmp/angular-cache
+      - /tmp/react-cache:/tmp/react-cache
+      - /tmp/vue-cache:/tmp/vue-cache
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    restart: unless-stopped
+    networks:
+      - compiler-network
+
+  # --- TEMPLATE BUILDERS ---
+  # These services exist ONLY to build the images. 
+  # We use 'profiles: ["tools"]' so they don't start by default.
+  
+  angular-compiler:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile.angular-compiler
+    image: angular-compiler:latest
+
+  react-compiler:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile.react-compiler
+    image: react-compiler:latest
+  
+  vue-compiler:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile.vue-compiler
+    image: vue-compiler:latest
+
+networks:
+  compiler-network:
+    driver: bridge
