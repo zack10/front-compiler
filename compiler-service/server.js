@@ -19,7 +19,6 @@ app.use(bodyParser.json({ limit: '10mb' }));
 const FRAMEWORKS = {
   angular: {
     image: 'angular-compiler:latest',
-    // Change this from app.component.ts to app.ts
     filePath: 'src/app/app.ts',
     distPath: '/workspace/template-app/dist/template-app',
     cacheHostPath: '/tmp/angular-cache',
