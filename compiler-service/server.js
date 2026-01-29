@@ -9,6 +9,20 @@ const app = express();
 const docker = new Docker();
 const PORT = process.env.PORT || 3001;
 
+// HTTP status codes
+const HTTP_STATUS = {
+  BAD_REQUEST: 400,
+  INTERNAL_SERVER_ERROR: 500,
+};
+
+// Docker resource limits (configurable via environment variables)
+// Can be updated at runtime via /config endpoint or per-request in /compile
+let DOCKER_LIMITS = {
+  MEMORY: Number(process.env.COMPILER_MEMORY_BYTES || 2147483648), // 2 GiB
+  CPU_PERIOD: Number(process.env.COMPILER_CPU_PERIOD || 100000),
+  CPU_QUOTA: Number(process.env.COMPILER_CPU_QUOTA || 200000),
+};
+
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
@@ -54,20 +68,120 @@ app.get('/health', (req, res) => {
 });
 
 /**
+ * Get runtime configuration
+ * @param {Object} res - The response object
+ * @returns {Object} A JSON object containing the Docker resource limits and a note about the PUT endpoint
+ */
+app.get('/config', (_req, res) => {
+  res.json({
+    dockerLimits: { ...DOCKER_LIMITS },
+    note: 'Use PUT /config to update these values at runtime',
+  });
+});
+
+/**
+ * Update runtime configuration
+ * @param {Object} req - The request object
+ * @param {Object} res - The response object
+ * @returns {Object} A JSON object containing the updated Docker resource limits
+ */
+app.put('/config', (req, res) => {
+  const { memory, cpuPeriod, cpuQuota } = req.body;
+
+  if (memory !== undefined) {
+    const memBytes = Number(memory);
+    if (isNaN(memBytes) || memBytes <= 0) {
+      return res.status(HTTP_STATUS.BAD_REQUEST).json({
+        success: false,
+        error: 'Invalid memory value. Must be a positive number (bytes)',
+      });
+    }
+    DOCKER_LIMITS.MEMORY = memBytes;
+  }
+
+  if (cpuPeriod !== undefined) {
+    const period = Number(cpuPeriod);
+    if (isNaN(period) || period <= 0) {
+      return res.status(HTTP_STATUS.BAD_REQUEST).json({
+        success: false,
+        error: 'Invalid cpuPeriod value. Must be a positive number',
+      });
+    }
+    DOCKER_LIMITS.CPU_PERIOD = period;
+  }
+
+  if (cpuQuota !== undefined) {
+    const quota = Number(cpuQuota);
+    if (isNaN(quota) || quota <= 0) {
+      return res.status(HTTP_STATUS.BAD_REQUEST).json({
+        success: false,
+        error: 'Invalid cpuQuota value. Must be a positive number',
+      });
+    }
+    DOCKER_LIMITS.CPU_QUOTA = quota;
+  }
+
+  res.json({
+    success: true,
+    message: 'Configuration updated',
+    dockerLimits: { ...DOCKER_LIMITS },
+  });
+});
+
+/**
  * Compiles the code
  * @param {Object} req - The request object
  * @param {Object} res - The response object
  * @returns {Object} A JSON object containing the success status, framework, files, and compilation time
  */
 app.post('/compile', async (req, res) => {
-  const { code, framework = 'angular', timeout = 60000 } = req.body;
+  const {
+    code,
+    framework = 'angular',
+    timeout = 60000,
+    memory,
+    cpuPeriod,
+    cpuQuota,
+  } = req.body;
   const compilationId = uuidv4();
   const config = FRAMEWORKS[framework.toLowerCase()];
 
   if (!config) {
     return res
-      .status(400)
+      .status(HTTP_STATUS.BAD_REQUEST)
       .json({ success: false, error: `Unsupported framework: ${framework}` });
+  }
+
+  // Validate required code field first
+  if (!code || typeof code !== 'string') {
+    return res
+      .status(HTTP_STATUS.BAD_REQUEST)
+      .json({ success: false, error: 'Invalid code provided' });
+  }
+
+  // Allow per-request resource limit overrides
+  const resourceLimits = {
+    memory: memory !== undefined ? Number(memory) : DOCKER_LIMITS.MEMORY,
+    cpuPeriod:
+      cpuPeriod !== undefined ? Number(cpuPeriod) : DOCKER_LIMITS.CPU_PERIOD,
+    cpuQuota:
+      cpuQuota !== undefined ? Number(cpuQuota) : DOCKER_LIMITS.CPU_QUOTA,
+  };
+
+  // Validate resource limits
+  if (
+    isNaN(resourceLimits.memory) ||
+    resourceLimits.memory <= 0 ||
+    isNaN(resourceLimits.cpuPeriod) ||
+    resourceLimits.cpuPeriod <= 0 ||
+    isNaN(resourceLimits.cpuQuota) ||
+    resourceLimits.cpuQuota <= 0
+  ) {
+    return res.status(HTTP_STATUS.BAD_REQUEST).json({
+      success: false,
+      error:
+        'Invalid resource limits. memory, cpuPeriod, and cpuQuota must be positive numbers',
+    });
   }
 
   console.log(`[${compilationId}] Starting ${framework} compilation...`);
@@ -75,17 +189,13 @@ app.post('/compile', async (req, res) => {
   const startTime = Date.now();
 
   try {
-    if (!code || typeof code !== 'string') {
-      return res
-        .status(400)
-        .json({ success: false, error: 'Invalid code provided' });
-    }
 
     container = await createCompilationContainer(
       compilationId,
       code,
       config,
       framework,
+      resourceLimits,
     );
     console.log(`[${compilationId}] Container created (${framework})`);
 
@@ -93,7 +203,7 @@ app.post('/compile', async (req, res) => {
     const result = await waitForCompletion(container, timeout);
 
     if (!result.success) {
-      return res.status(400).json({
+      return res.status(HTTP_STATUS.BAD_REQUEST).json({
         success: false,
         error: `${framework.toUpperCase()} Build Failed`,
         logs: result.logs,
@@ -116,7 +226,9 @@ app.post('/compile', async (req, res) => {
     });
   } catch (error) {
     console.error(`[${compilationId}] Error:`, error);
-    res.status(500).json({ success: false, error: error.message });
+    res
+      .status(HTTP_STATUS.INTERNAL_SERVER_ERROR)
+      .json({ success: false, error: error.message });
   } finally {
     if (container) {
       try {
@@ -134,6 +246,7 @@ app.post('/compile', async (req, res) => {
  * @param {string} userCode - The user's code to compile
  * @param {Object} config - The configuration for the compilation
  * @param {string} framework - The framework to compile
+ * @param {Object} resourceLimits - Optional resource limits (memory, cpuPeriod, cpuQuota)
  * @returns {Promise<Docker.Container>} A promise that resolves to the created container
  */
 async function createCompilationContainer(
@@ -141,6 +254,7 @@ async function createCompilationContainer(
   userCode,
   config,
   framework,
+  resourceLimits = DOCKER_LIMITS,
 ) {
   // prepare the code for the specific framework
   const finalCode = framework === 'angular' ? prepareAngularCode(userCode) : userCode;
@@ -165,7 +279,7 @@ async function createCompilationContainer(
       `
 cd /workspace/template-app
 ${cleanupCmd}
-echo "${base64Code}" | base64 -d > ${config.filePath}
+printf '%s' "${base64Code}" | base64 -d > ${config.filePath}
 # Ensure the file timestamp is updated for Vite to pick up changes
 touch ${config.filePath}
 sync
@@ -174,9 +288,9 @@ ${config.buildCmd} && echo "COMPILATION_COMPLETE"
     ],
     HostConfig: {
       Binds: [`${config.cacheHostPath}:${config.cacheContPath}`],
-      Memory: 2147483648,
-      CpuPeriod: 100000,
-      CpuQuota: 200000,
+      Memory: resourceLimits.memory ?? resourceLimits.MEMORY,
+      CpuPeriod: resourceLimits.cpuPeriod ?? resourceLimits.CPU_PERIOD,
+      CpuQuota: resourceLimits.cpuQuota ?? resourceLimits.CPU_QUOTA,
     },
     User: 'root',
   });
@@ -213,42 +327,44 @@ function prepareAngularCode(userCode) {
  * @returns {Promise<Object>} A promise that resolves to an object containing the success status and logs
  */
 async function waitForCompletion(container, timeout) {
-  return new Promise(async (resolve) => {
+  return new Promise((resolve) => {
     const timeoutId = setTimeout(() => {
       resolve({ success: false, error: 'Compilation timeout', logs: '' });
     }, timeout);
 
-    try {
-      const waitResult = await container.wait();
-      const logsBuffer = await container.logs({
-        stdout: true,
-        stderr: true,
-        follow: false,
-      });
+    (async () => {
+      try {
+        const waitResult = await container.wait();
+        const logsBuffer = await container.logs({
+          stdout: true,
+          stderr: true,
+          follow: false,
+        });
 
-      let cleanLogs = '';
-      let offset = 0;
-      while (offset < logsBuffer.length) {
-        const length = logsBuffer.readUInt32BE(offset + 4);
-        offset += 8;
-        cleanLogs += logsBuffer.toString('utf8', offset, offset + length);
-        offset += length;
+        let cleanLogs = '';
+        let offset = 0;
+        while (offset < logsBuffer.length) {
+          const length = logsBuffer.readUInt32BE(offset + 4);
+          offset += 8;
+          cleanLogs += logsBuffer.toString('utf8', offset, offset + length);
+          offset += length;
+        }
+
+        clearTimeout(timeoutId);
+
+        if (
+          waitResult.StatusCode === 0 &&
+          cleanLogs.includes('COMPILATION_COMPLETE')
+        ) {
+          resolve({ success: true, logs: cleanLogs });
+        } else {
+          resolve({ success: false, error: 'Build Failed', logs: cleanLogs });
+        }
+      } catch (error) {
+        clearTimeout(timeoutId);
+        resolve({ success: false, error: error.message, logs: '' });
       }
-
-      clearTimeout(timeoutId);
-
-      if (
-        waitResult.StatusCode === 0 &&
-        cleanLogs.includes('COMPILATION_COMPLETE')
-      ) {
-        resolve({ success: true, logs: cleanLogs });
-      } else {
-        resolve({ success: false, error: 'Build Failed', logs: cleanLogs });
-      }
-    } catch (error) {
-      clearTimeout(timeoutId);
-      resolve({ success: false, error: error.message, logs: '' });
-    }
+    })();
   });
 }
 
