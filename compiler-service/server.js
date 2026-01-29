@@ -23,6 +23,9 @@ let DOCKER_LIMITS = {
   CPU_QUOTA: Number(process.env.COMPILER_CPU_QUOTA || 200000),
 };
 
+// Default compilation timeout in milliseconds (configurable via env and /config)
+let DEFAULT_COMPILE_TIMEOUT_MS = Number(process.env.COMPILER_TIMEOUT_MS || 60000);
+
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
@@ -75,6 +78,7 @@ app.get('/health', (req, res) => {
 app.get('/config', (_req, res) => {
   res.json({
     dockerLimits: { ...DOCKER_LIMITS },
+    defaultCompileTimeoutMs: DEFAULT_COMPILE_TIMEOUT_MS,
     note: 'Use PUT /config to update these values at runtime',
   });
 });
@@ -86,7 +90,18 @@ app.get('/config', (_req, res) => {
  * @returns {Object} A JSON object containing the updated Docker resource limits
  */
 app.put('/config', (req, res) => {
-  const { memory, cpuPeriod, cpuQuota } = req.body;
+  const { memory, cpuPeriod, cpuQuota, timeout } = req.body;
+
+  if (timeout !== undefined) {
+    const timeoutMs = Number(timeout);
+    if (isNaN(timeoutMs) || timeoutMs <= 0) {
+      return res.status(HTTP_STATUS.BAD_REQUEST).json({
+        success: false,
+        error: 'Invalid timeout value. Must be a positive number (milliseconds)',
+      });
+    }
+    DEFAULT_COMPILE_TIMEOUT_MS = timeoutMs;
+  }
 
   if (memory !== undefined) {
     const memBytes = Number(memory);
@@ -125,6 +140,7 @@ app.put('/config', (req, res) => {
     success: true,
     message: 'Configuration updated',
     dockerLimits: { ...DOCKER_LIMITS },
+    defaultCompileTimeoutMs: DEFAULT_COMPILE_TIMEOUT_MS,
   });
 });
 
@@ -138,13 +154,22 @@ app.post('/compile', async (req, res) => {
   const {
     code,
     framework = 'angular',
-    timeout = 60000,
+    timeout,
     memory,
     cpuPeriod,
     cpuQuota,
   } = req.body;
   const compilationId = uuidv4();
   const config = FRAMEWORKS[framework.toLowerCase()];
+
+  // Use per-request timeout or global default; validate
+  const compileTimeoutMs = timeout !== undefined ? Number(timeout) : DEFAULT_COMPILE_TIMEOUT_MS;
+  if (isNaN(compileTimeoutMs) || compileTimeoutMs <= 0) {
+    return res.status(HTTP_STATUS.BAD_REQUEST).json({
+      success: false,
+      error: 'Invalid timeout value. Must be a positive number (milliseconds)',
+    });
+  }
 
   if (!config) {
     return res
@@ -200,7 +225,7 @@ app.post('/compile', async (req, res) => {
     console.log(`[${compilationId}] Container created (${framework})`);
 
     await container.start();
-    const result = await waitForCompletion(container, timeout);
+    const result = await waitForCompletion(container, compileTimeoutMs);
 
     if (!result.success) {
       return res.status(HTTP_STATUS.BAD_REQUEST).json({
